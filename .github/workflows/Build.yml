@@ -9,9 +9,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: HondaOBDDiscovery
 
     steps:
       - name: Checkout
@@ -23,29 +20,40 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          build-root-directory: HondaOBDDiscovery
-
-      - name: Ensure Gradle Wrapper exists
+      - name: Locate project & prepare Gradle
         run: |
+          # Znajdź katalog zawierający settings.gradle lub settings.gradle.kts
+          SETTINGS_FILE=$(find . -maxdepth 2 -name "settings.gradle*" | head -n 1)
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::Nie znaleziono pliku settings.gradle ani settings.gradle.kts w repozytorium!"
+            echo "Aktualna struktura plików:"
+            ls -la
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          echo "Znaleziono projekt w: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+          cd "$PROJECT_DIR"
+
+          # Jeśli brakuje wrapper.jar, wygeneruj go
           if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "gradle-wrapper.jar missing, regenerating..."
+            echo "Generowanie Gradle Wrapper 8.2..."
             gradle wrapper --gradle-version 8.2
           fi
-          chmod +x gradlew
+
+          chmod +x gradlew || true
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          cd "$PROJECT_DIR"
+          ./gradlew assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: HondaOBDDiscovery-debug
-          path: HondaOBDDiscovery/app/build/outputs/apk/debug/*.apk
+          path: "**/build/outputs/apk/debug/*.apk"
           if-no-files-found: error
-
-      - name: List outputs
-        if: always()
-        run: find app/build/outputs -name "*.apk" || true
