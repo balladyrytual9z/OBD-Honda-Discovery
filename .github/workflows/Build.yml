@@ -1,4 +1,4 @@
-name: Build APK
+name: Build APK from iPhone ZIP
 
 on:
   push:
@@ -20,25 +20,44 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Locate project & prepare Gradle
+      - name: Unpack ZIP & prepare workspace
         run: |
-          # Znajdź katalog zawierający settings.gradle lub settings.gradle.kts
-          SETTINGS_FILE=$(find . -maxdepth 2 -name "settings.gradle*" | head -n 1)
+          # Znajdź dowolny plik ZIP wrzucony do repozytorium
+          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::Nie znaleziono pliku .zip w repozytorium!"
+            exit 1
+          fi
+
+          echo "Rozpakowywanie: $ZIP_FILE"
+          unzip -o -q "$ZIP_FILE"
+
+          # Usunięcie śmieci dodawanych przez iOS / macOS
+          rm -rf __MACOSX
+          find . -name "._*" -delete || true
+
+          # Znajdź katalog, w którym znajduje się settings.gradle lub settings.gradle.kts
+          SETTINGS_FILE=$(find . -name "settings.gradle*" | head -n 1)
 
           if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::Nie znaleziono pliku settings.gradle ani settings.gradle.kts w repozytorium!"
-            echo "Aktualna struktura plików:"
-            ls -la
+            echo "::error::W pliku ZIP nie znaleziono settings.gradle ani settings.gradle.kts!"
             exit 1
           fi
 
           PROJECT_DIR=$(dirname "$SETTINGS_FILE")
-          echo "Znaleziono projekt w: $PROJECT_DIR"
+          echo "Katalog projektu: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
           cd "$PROJECT_DIR"
 
-          # Jeśli brakuje wrapper.jar, wygeneruj go
+          # Automatyczne dodanie repozytorium JitPack dla biblioteki MPAndroidChart
+          if [ -f "settings.gradle.kts" ] && ! grep -q "jitpack.io" settings.gradle.kts; then
+            echo "Dodawanie JitPack do settings.gradle.kts..."
+            sed -i '/mavenCentral()/a \        maven { url = java.net.URI("https://jitpack.io") }' settings.gradle.kts
+          fi
+
+          # Jeśli w ZIP nie ma pliku gradle-wrapper.jar, wygeneruj go
           if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
             echo "Generowanie Gradle Wrapper 8.2..."
             gradle wrapper --gradle-version 8.2
@@ -50,6 +69,13 @@ jobs:
         run: |
           cd "$PROJECT_DIR"
           ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HondaOBDDiscovery-debug
+          path: "**/build/outputs/apk/debug/*.apk"
+          if-no-files-found: error
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
