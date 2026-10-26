@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: HondaOBDDiscovery
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,26 +25,27 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          build-root-directory: HondaOBDDiscovery
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew || true
+      - name: Ensure Gradle Wrapper exists
+        run: |
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "gradle-wrapper.jar missing, regenerating..."
+            gradle wrapper --gradle-version 8.2
+          fi
+          chmod +x gradlew
 
       - name: Build debug APK
-        run: |
-          if [ -f ./gradlew ]; then
-            ./gradlew assembleDebug --stacktrace
-          else
-            # Fallback when wrapper not present yet
-            gradle wrapper --gradle-version 8.2
-            ./gradlew assembleDebug --stacktrace
-          fi
+        run: ./gradlew assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: HondaOBDDiscovery-debug
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
+          path: HondaOBDDiscovery/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
 
       - name: List outputs
+        if: always()
         run: find app/build/outputs -name "*.apk" || true
