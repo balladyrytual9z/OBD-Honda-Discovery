@@ -1,3 +1,4 @@
+
 name: Build Honda OBD Discovery APK
 
 on:
@@ -18,83 +19,221 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Wypakuj ZIP gdy brak gradlew w root
+      - name: Locate and prepare project
         id: prepare
+        shell: bash
         run: |
           set -euo pipefail
-          if [ -f ./gradlew ]; then
-            echo "src=." >> "$GITHUB_OUTPUT"
-            echo "Źródła w katalogu głównym"
-            chmod +x ./gradlew
-            exit 0
-          fi
-          ZIP=$(find . -maxdepth 2 -type f \( \
-            -name 'Honda-OBD-Discovery*.zip' \
-            -o -name 'honda-obd*.zip' \
-            -o -name '*OBD*.zip' \
-            -o -name '*.zip' \
-          \) ! -path './.git/*' | head -n 1 || true)
-          if [ -z "$ZIP" ]; then
-            echo "::error::Brak gradlew i brak .zip — wrzuć źródła albo ZIP."
-            ls -la
-            exit 1
-          fi
-          echo "Wypakowuję: $ZIP"
-          mkdir -p _src
-          unzip -q -o "$ZIP" -d _src
-          if [ -f _src/gradlew ]; then
-            SRC=_src
-          else
-            SRC=$(find _src -maxdepth 3 -type f -name gradlew | head -n 1 | xargs -r dirname)
-          fi
-          if [ -z "${SRC:-}" ] || [ ! -f "$SRC/gradlew" ]; then
-            echo "::error::Po rozpakowaniu nie ma gradlew"
-            find _src -maxdepth 4 | head -50
-            exit 1
-          fi
-          chmod +x "$SRC/gradlew"
-          echo "src=$SRC" >> "$GITHUB_OUTPUT"
-          echo "Źródła: $SRC"
 
-      - name: Java 21
+          SRC=""
+
+          # 1. Project directly in repository root
+          if [ -f "./settings.gradle" ] || [ -f "./settings.gradle.kts" ]; then
+            SRC="."
+          fi
+
+          # 2. Search existing project directories
+          if [ -z "$SRC" ]; then
+            for SETTINGS in $(find . -maxdepth 5 -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              ! -path './.git/*' | sort); do
+              DIR=$(dirname "$SETTINGS")
+              if [ -f "$DIR/app/build.gradle" ] || \
+                 [ -f "$DIR/app/build.gradle.kts" ]; then
+                SRC="$DIR"
+                break
+              fi
+            done
+          fi
+
+          # 3. Extract ZIP if project was not found
+          if [ -z "$SRC" ]; then
+            ZIP=$(find . -maxdepth 3 -type f -iname '*.zip' \
+              ! -path './.git/*' | head -n 1 || true)
+
+            if [ -z "$ZIP" ]; then
+              echo "::error::Nie znaleziono projektu Gradle ani ZIP."
+              find . -maxdepth 3 -type f | head -100
+              exit 1
+            fi
+
+            echo "Extracting: $ZIP"
+            mkdir -p _src
+            unzip -q -o "$ZIP" -d _src
+
+            for SETTINGS in $(find _src -maxdepth 7 -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              | sort); do
+              DIR=$(dirname "$SETTINGS")
+              if [ -f "$DIR/app/build.gradle" ] || \
+                 [ -f "$DIR/app/build.gradle.kts" ]; then
+                SRC="$DIR"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$SRC" ]; then
+            echo "::error::Nie znaleziono katalogu projektu z modułem app."
+            find . -maxdepth 5 -type f | head -150
+            exit 1
+          fi
+
+          SRC=$(cd "$SRC" && pwd)
+
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "PROJECT=$SRC"
+
+          ls -la "$SRC"
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
+          cache: gradle
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      # Nie instalujemy przestarzałego pakietu "tools" — on już nie istnieje w SDK
-      # i psuje android-actions/setup-android przy domyślnych ustawieniach.
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools platforms;android-35 build-tools;35.0.0
-
-      - name: Licencje SDK
-        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
-      - name: Testy jednostkowe
+      - name: Prepare Gradle
+        id: gradle
         working-directory: ${{ steps.prepare.outputs.src }}
-        run: ./gradlew test --stacktrace --no-daemon
-        continue-on-error: true
-
-      - name: Zbuduj APK (app + Kasuj DTC)
-        working-directory: ${{ steps.prepare.outputs.src }}
+        shell: bash
         run: |
           set -euo pipefail
-          ./gradlew :app:assembleDebug :dtcclear:assembleDebug --stacktrace --no-daemon
-          echo "=== APK ==="
-          find . -path '*/build/outputs/apk/**/*.apk' -type f
 
-      - name: Upload APK
+          echo "Checking Gradle Wrapper..."
+
+          GRADLE_CMD=""
+
+          if [ -f "./gradlew" ] && \
+             [ -s "./gradle/wrapper/gradle-wrapper.jar" ] && \
+             [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
+
+            chmod +x ./gradlew
+
+            if jar tf gradle/wrapper/gradle-wrapper.jar >/dev/null 2>&1; then
+              echo "Valid Wrapper found."
+              GRADLE_CMD="./gradlew"
+            fi
+          fi
+
+          if [ -z "$GRADLE_CMD" ]; then
+            echo "Wrapper missing or broken. Using official Gradle distribution."
+
+            VERSION="8.9"
+
+            # Read version from wrapper properties if available
+            if [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
+              URL=$(grep -E '^distributionUrl=' \
+                gradle/wrapper/gradle-wrapper.properties \
+                | tail -n 1 | cut -d '=' -f 2- | sed 's/\\:/:/g' || true)
+
+              if [[ "$URL" =~ gradle-([0-9]+\.[0-9]+(\.[0-9]+)?)-(bin|all)\.zip ]]; then
+                VERSION="${BASH_REMATCH[1]}"
+              fi
+            fi
+
+            echo "Gradle version: $VERSION"
+
+            mkdir -p "$RUNNER_TEMP/gradle"
+
+            if [ ! -x "$RUNNER_TEMP/gradle/gradle-$VERSION/bin/gradle" ]; then
+              curl -fL --retry 3 \
+                "https://services.gradle.org/distributions/gradle-$VERSION-bin.zip" \
+                -o "$RUNNER_TEMP/gradle/gradle.zip"
+
+              unzip -q -o "$RUNNER_TEMP/gradle/gradle.zip" \
+                -d "$RUNNER_TEMP/gradle"
+
+              rm -f "$RUNNER_TEMP/gradle/gradle.zip"
+            fi
+
+            GRADLE_CMD="$RUNNER_TEMP/gradle/gradle-$VERSION/bin/gradle"
+          fi
+
+          echo "gradle_cmd=$GRADLE_CMD" >> "$GITHUB_OUTPUT"
+
+          $GRADLE_CMD --version
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Verify project modules
+        working-directory: ${{ steps.prepare.outputs.src }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== PROJECT MODULES ==="
+          find . -maxdepth 3 -type f \
+            \( -name 'build.gradle' -o -name 'build.gradle.kts' \)
+
+          if [ ! -f "app/build.gradle" ] && \
+             [ ! -f "app/build.gradle.kts" ]; then
+            echo "::error::Brak modułu app."
+            exit 1
+          fi
+
+          if [ ! -f "dtcclear/build.gradle" ] && \
+             [ ! -f "dtcclear/build.gradle.kts" ]; then
+            echo "::warning::Nie znaleziono modułu dtcclear."
+          fi
+
+      - name: Run unit tests
+        working-directory: ${{ steps.prepare.outputs.src }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          GRADLE="${{ steps.gradle.outputs.gradle_cmd }}"
+
+          "$GRADLE" test \
+            --stacktrace \
+            --no-daemon
+
+      - name: Build APK
+        working-directory: ${{ steps.prepare.outputs.src }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLE="${{ steps.gradle.outputs.gradle_cmd }}"
+
+          TASKS=(":app:assembleDebug")
+
+          if [ -f "dtcclear/build.gradle" ] || \
+             [ -f "dtcclear/build.gradle.kts" ]; then
+            TASKS+=(":dtcclear:assembleDebug")
+          fi
+
+          echo "=== BUILDING APK ==="
+
+          "$GRADLE" "${TASKS[@]}" \
+            --stacktrace \
+            --no-daemon
+
+          echo "=== GENERATED APK FILES ==="
+
+          find . -type f -path '*/build/outputs/apk/*/*.apk' \
+            -print
+
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Honda-OBD-Discovery-APKs
           path: |
-            ${{ steps.prepare.outputs.src }}/app/build/outputs/apk/debug/*.apk
-            ${{ steps.prepare.outputs.src }}/dtcclear/build/outputs/apk/debug/*.apk
+            ${{ steps.prepare.outputs.src }}/app/build/outputs/apk/**/*.apk
+            ${{ steps.prepare.outputs.src }}/dtcclear/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 30
-
