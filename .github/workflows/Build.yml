@@ -57,18 +57,38 @@ jobs:
       - name: Extract ZIP contents
         run: |
           mkdir -p extracted_source
-          unzip -q "${{ steps.find-zip.outputs.zip_file }}" -d extracted_source
+          unzip -o -q "${{ steps.find-zip.outputs.zip_file }}" -d extracted_source
+          echo "Zawartość rozpakowanego pliku ZIP:"
+          find extracted_source -maxdepth 3
 
       - name: Locate Gradle project root
         id: find-gradle
         run: |
-          GRADLE_FILE=$(find extracted_source -name "settings.gradle" -o -name "build.gradle" | head -n 1)
-          if [ -z "$GRADLE_FILE" ]; then
-            echo "Error: Nie znaleziono pliku build.gradle / settings.gradle wewnątrz ZIP-a!"
+          # Szukamy najpierw pliku settings.gradle / settings.gradle.kts (główny katalog projektu)
+          SETTINGS_FILE=$(find extracted_source \( -iname "settings.gradle" -o -iname "settings.gradle.kts" \) | head -n 1)
+          
+          if [ -n "$SETTINGS_FILE" ]; then
+            PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          else
+            # Jeśli brak settings.gradle, szukamy build.gradle / build.gradle.kts
+            BUILD_FILE=$(find extracted_source \( -iname "build.gradle" -o -iname "build.gradle.kts" \) | head -n 1)
+            if [ -n "$BUILD_FILE" ]; then
+              PROJECT_DIR=$(dirname "$BUILD_FILE")
+              # Jeśli trafiliśmy do podfolderu /app, przechodzimy poziom wyżej do korzenia projektu
+              if [ "$(basename "$PROJECT_DIR")" = "app" ] && [ -f "$(dirname "$PROJECT_DIR")/build.gradle" -o -f "$(dirname "$PROJECT_DIR")/settings.gradle" ]; then
+                PROJECT_DIR=$(dirname "$PROJECT_DIR")
+              fi
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -d "$PROJECT_DIR" ]; then
+            echo "::error:: Nie znaleziono pliku budowania (settings.gradle lub build.gradle) wewnątrz ZIP-a!"
+            echo "Pełna struktura rozpakowanych plików:"
+            find extracted_source
             exit 1
           fi
-          PROJECT_DIR=$(dirname "$GRADLE_FILE")
-          echo "Katalog projektu: $PROJECT_DIR"
+
+          echo "Główny katalog projektu Gradle: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
 
       - name: Build APK with Gradle
