@@ -1,6 +1,4 @@
 
-
-
 name: Build Honda OBD Discovery APK
 
 on:
@@ -16,10 +14,6 @@ jobs:
     name: Build APKs
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
-    env:
-      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
-      ANDROID_HOME: ${{ runner.temp }}/android-sdk
 
     steps:
       - name: Checkout
@@ -87,7 +81,6 @@ jobs:
           fi
 
           SRC=$(cd "$SRC" && pwd)
-
           echo "src=$SRC" >> "$GITHUB_OUTPUT"
           echo "Projekt: $SRC"
           ls -la "$SRC"
@@ -98,12 +91,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Nie używamy android-actions/setup-android.
-      # Instalujemy świeże Command-line Tools do osobnego katalogu.
       - name: Install Android Command-line Tools
         shell: bash
         run: |
           set -euo pipefail
+
+          export ANDROID_SDK_ROOT="$RUNNER_TEMP/android-sdk"
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
           SDK="$ANDROID_SDK_ROOT"
           TEMP_TOOLS="$RUNNER_TEMP/android-cli-download"
@@ -133,11 +131,9 @@ jobs:
             "$SDK/cmdline-tools/latest/"
 
           SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-
           chmod +x "$SDKMANAGER"
 
           echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
 
           echo "Android SDK: $SDK"
           "$SDKMANAGER" --version
@@ -159,7 +155,7 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-          echo "=== INSTALLED SDK PACKAGES ==="
+          echo "=== Installed SDK packages ==="
 
           "$SDKMANAGER" \
             --sdk_root="$ANDROID_SDK_ROOT" \
@@ -174,7 +170,6 @@ jobs:
 
           GRADLE_CMD=""
 
-          # Use the project wrapper only if its JAR is valid.
           if [ -f "./gradlew" ] && \
              [ -s "./gradle/wrapper/gradle-wrapper.jar" ] && \
              [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
@@ -187,7 +182,6 @@ jobs:
             fi
           fi
 
-          # Otherwise download the official Gradle distribution.
           if [ -z "$GRADLE_CMD" ]; then
             VERSION="8.9"
 
@@ -222,7 +216,6 @@ jobs:
           fi
 
           echo "gradle_cmd=$GRADLE_CMD" >> "$GITHUB_OUTPUT"
-
           "$GRADLE_CMD" --version
 
       - name: Verify project modules
@@ -238,7 +231,6 @@ jobs:
           fi
 
           echo "=== Moduły Gradle ==="
-
           find . -maxdepth 4 -type f \
             \( -name build.gradle -o -name build.gradle.kts \) \
             -print
@@ -278,7 +270,6 @@ jobs:
             --no-daemon
 
           echo "=== Wygenerowane APK ==="
-
           find . -type f -path '*/build/outputs/apk/*/*.apk' -print
 
           if ! find app/build/outputs/apk \
