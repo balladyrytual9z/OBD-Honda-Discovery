@@ -1,5 +1,6 @@
 
 
+
 name: Build Honda OBD Discovery APK
 
 on:
@@ -16,6 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    env:
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+      ANDROID_HOME: ${{ runner.temp }}/android-sdk
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,12 +33,10 @@ jobs:
 
           SRC=""
 
-          # Project directly in repository root
-          if [ -f "./settings.gradle" ] || [ -f "./settings.gradle.kts" ]; then
+          if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
             SRC="."
           fi
 
-          # Search existing project directories
           if [ -z "$SRC" ]; then
             while IFS= read -r SETTINGS; do
               DIR=$(dirname "$SETTINGS")
@@ -43,24 +46,23 @@ jobs:
                 break
               fi
             done < <(
-              find . -maxdepth 6 -type f \
+              find . -maxdepth 7 -type f \
                 \( -name settings.gradle -o -name settings.gradle.kts \) \
                 ! -path './.git/*' | sort
             )
           fi
 
-          # Extract ZIP if project was not found
           if [ -z "$SRC" ]; then
-            ZIP=$(find . -maxdepth 3 -type f -iname '*.zip' \
+            ZIP=$(find . -maxdepth 4 -type f -iname '*.zip' \
               ! -path './.git/*' | head -n 1 || true)
 
             if [ -z "$ZIP" ]; then
               echo "::error::Nie znaleziono projektu Gradle ani ZIP."
-              find . -maxdepth 3 -type f | head -100
+              find . -maxdepth 4 -type f | head -100
               exit 1
             fi
 
-            echo "Extracting: $ZIP"
+            echo "Rozpakowuję: $ZIP"
             mkdir -p _src
             unzip -q -o "$ZIP" -d _src
 
@@ -72,7 +74,7 @@ jobs:
                 break
               fi
             done < <(
-              find _src -maxdepth 8 -type f \
+              find _src -maxdepth 9 -type f \
                 \( -name settings.gradle -o -name settings.gradle.kts \) \
                 | sort
             )
@@ -87,7 +89,7 @@ jobs:
           SRC=$(cd "$SRC" && pwd)
 
           echo "src=$SRC" >> "$GITHUB_OUTPUT"
-          echo "Project directory: $SRC"
+          echo "Projekt: $SRC"
           ls -la "$SRC"
 
       - name: Setup Java 17
@@ -95,6 +97,73 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      # Nie używamy android-actions/setup-android.
+      # Instalujemy świeże Command-line Tools do osobnego katalogu.
+      - name: Install Android Command-line Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="$ANDROID_SDK_ROOT"
+          TEMP_TOOLS="$RUNNER_TEMP/android-cli-download"
+
+          mkdir -p "$SDK/cmdline-tools" "$TEMP_TOOLS"
+
+          URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+
+          echo "Pobieram oficjalne Android Command-line Tools..."
+
+          curl -fL --retry 3 "$URL" \
+            -o "$TEMP_TOOLS/commandlinetools.zip"
+
+          unzip -q -o "$TEMP_TOOLS/commandlinetools.zip" \
+            -d "$TEMP_TOOLS"
+
+          if [ ! -f "$TEMP_TOOLS/cmdline-tools/bin/sdkmanager" ]; then
+            echo "::error::Pobrany pakiet nie zawiera sdkmanager."
+            find "$TEMP_TOOLS" -maxdepth 4 -type f | head -80
+            exit 1
+          fi
+
+          rm -rf "$SDK/cmdline-tools/latest"
+          mkdir -p "$SDK/cmdline-tools/latest"
+
+          cp -a "$TEMP_TOOLS/cmdline-tools/." \
+            "$SDK/cmdline-tools/latest/"
+
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
+          chmod +x "$SDKMANAGER"
+
+          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+
+          echo "Android SDK: $SDK"
+          "$SDKMANAGER" --version
+
+      - name: Accept licenses and install SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --licenses || true
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          echo "=== INSTALLED SDK PACKAGES ==="
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --list_installed
 
       - name: Prepare Gradle
         id: gradle
@@ -105,19 +174,20 @@ jobs:
 
           GRADLE_CMD=""
 
-          # Use a complete and valid Gradle Wrapper if available
+          # Use the project wrapper only if its JAR is valid.
           if [ -f "./gradlew" ] && \
              [ -s "./gradle/wrapper/gradle-wrapper.jar" ] && \
              [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
 
             chmod +x ./gradlew
 
-            if jar tf gradle/wrapper/gradle-wrapper.jar >/dev/null 2>&1; then
+            if jar tf gradle/wrapper/gradle-wrapper.jar \
+              >/dev/null 2>&1; then
               GRADLE_CMD="./gradlew"
             fi
           fi
 
-          # Fall back to an official Gradle distribution
+          # Otherwise download the official Gradle distribution.
           if [ -z "$GRADLE_CMD" ]; then
             VERSION="8.9"
 
@@ -132,17 +202,19 @@ jobs:
               fi
             fi
 
-            echo "Using Gradle $VERSION"
-
             GRADLE_DIR="$RUNNER_TEMP/gradle"
             mkdir -p "$GRADLE_DIR"
+
+            echo "Używam Gradle $VERSION"
 
             if [ ! -x "$GRADLE_DIR/gradle-$VERSION/bin/gradle" ]; then
               curl -fL --retry 3 \
                 "https://services.gradle.org/distributions/gradle-$VERSION-bin.zip" \
                 -o "$GRADLE_DIR/gradle.zip"
 
-              unzip -q -o "$GRADLE_DIR/gradle.zip" -d "$GRADLE_DIR"
+              unzip -q -o "$GRADLE_DIR/gradle.zip" \
+                -d "$GRADLE_DIR"
+
               rm -f "$GRADLE_DIR/gradle.zip"
             fi
 
@@ -150,49 +222,8 @@ jobs:
           fi
 
           echo "gradle_cmd=$GRADLE_CMD" >> "$GITHUB_OUTPUT"
+
           "$GRADLE_CMD" --version
-
-      # Do not pass a package list to setup-android.
-      # This avoids the obsolete "tools" package lookup.
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-
-          if [ -z "$SDK_ROOT" ]; then
-            echo "::error::ANDROID_HOME and ANDROID_SDK_ROOT are unset."
-            exit 1
-          fi
-
-          SDKMANAGER=""
-
-          if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          else
-            SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" \
-              -type f -name sdkmanager -perm /111 2>/dev/null \
-              | head -n 1 || true)
-          fi
-
-          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "::error::Nie znaleziono wykonywalnego sdkmanager."
-            find "$SDK_ROOT" -maxdepth 4 -name sdkmanager -print || true
-            exit 1
-          fi
-
-          echo "SDK manager: $SDKMANAGER"
-
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-
-          "$SDKMANAGER" \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
 
       - name: Verify project modules
         working-directory: ${{ steps.prepare.outputs.src }}
@@ -200,35 +231,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "=== GRADLE MODULE FILES ==="
+          if [ ! -f app/build.gradle ] && \
+             [ ! -f app/build.gradle.kts ]; then
+            echo "::error::Brak konfiguracji modułu app."
+            exit 1
+          fi
+
+          echo "=== Moduły Gradle ==="
+
           find . -maxdepth 4 -type f \
             \( -name build.gradle -o -name build.gradle.kts \) \
             -print
 
-          if [ ! -f "app/build.gradle" ] && \
-             [ ! -f "app/build.gradle.kts" ]; then
-            echo "::error::Brak modułu app."
-            exit 1
+          if [ ! -f dtcclear/build.gradle ] && \
+             [ ! -f dtcclear/build.gradle.kts ]; then
+            echo "::warning::Nie znaleziono modułu dtcclear."
           fi
-
-          if [ ! -f "dtcclear/build.gradle" ] && \
-             [ ! -f "dtcclear/build.gradle.kts" ]; then
-            echo "::warning::Nie znaleziono modułu dtcclear. Pomijam go."
-          fi
-
-      - name: Verify Android 9 compatibility
-        working-directory: ${{ steps.prepare.outputs.src }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking configured SDK versions..."
-
-          grep -R -n -E \
-            'minSdk([Vv]ersion)?[[:space:]]*(=|[[:space:]])*28|targetSdk([Vv]ersion)?[[:space:]]*(=|[[:space:]])*28' \
-            app/build.gradle app/build.gradle.kts 2>/dev/null || true
-
-          echo "The APK must have minSdk <= 28 to install on Android 9."
 
       - name: Run unit tests
         working-directory: ${{ steps.prepare.outputs.src }}
@@ -250,8 +268,8 @@ jobs:
 
           TASKS=(":app:assembleDebug")
 
-          if [ -f "dtcclear/build.gradle" ] || \
-             [ -f "dtcclear/build.gradle.kts" ]; then
+          if [ -f dtcclear/build.gradle ] || \
+             [ -f dtcclear/build.gradle.kts ]; then
             TASKS+=(":dtcclear:assembleDebug")
           fi
 
@@ -259,11 +277,13 @@ jobs:
             --stacktrace \
             --no-daemon
 
-          echo "=== GENERATED APK FILES ==="
+          echo "=== Wygenerowane APK ==="
+
           find . -type f -path '*/build/outputs/apk/*/*.apk' -print
 
-          if ! find app/build/outputs/apk -type f -name '*.apk' \
-            -print -quit 2>/dev/null | grep -q .; then
+          if ! find app/build/outputs/apk \
+            -type f -name '*.apk' -print -quit \
+            2>/dev/null | grep -q .; then
             echo "::error::Nie wygenerowano APK modułu app."
             exit 1
           fi
@@ -277,4 +297,3 @@ jobs:
             ${{ steps.prepare.outputs.src }}/dtcclear/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 30
-
