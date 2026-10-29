@@ -1,290 +1,108 @@
-
-name: Build Honda OBD Discovery APK
+name: Build & Release from ZIP
 
 on:
   push:
-    branches: ["**"]
+    paths:
+      - '**.zip'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    name: Build APKs
+  build-and-release:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Locate and prepare project
-        id: prepare
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SRC=""
-
-          if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
-            SRC="."
-          fi
-
-          if [ -z "$SRC" ]; then
-            while IFS= read -r SETTINGS; do
-              DIR=$(dirname "$SETTINGS")
-              if [ -f "$DIR/app/build.gradle" ] || \
-                 [ -f "$DIR/app/build.gradle.kts" ]; then
-                SRC="$DIR"
-                break
-              fi
-            done < <(
-              find . -maxdepth 7 -type f \
-                \( -name settings.gradle -o -name settings.gradle.kts \) \
-                ! -path './.git/*' | sort
-            )
-          fi
-
-          if [ -z "$SRC" ]; then
-            ZIP=$(find . -maxdepth 4 -type f -iname '*.zip' \
-              ! -path './.git/*' | head -n 1 || true)
-
-            if [ -z "$ZIP" ]; then
-              echo "::error::Nie znaleziono projektu Gradle ani ZIP."
-              find . -maxdepth 4 -type f | head -100
-              exit 1
-            fi
-
-            echo "Rozpakowuję: $ZIP"
-            mkdir -p _src
-            unzip -q -o "$ZIP" -d _src
-
-            while IFS= read -r SETTINGS; do
-              DIR=$(dirname "$SETTINGS")
-              if [ -f "$DIR/app/build.gradle" ] || \
-                 [ -f "$DIR/app/build.gradle.kts" ]; then
-                SRC="$DIR"
-                break
-              fi
-            done < <(
-              find _src -maxdepth 9 -type f \
-                \( -name settings.gradle -o -name settings.gradle.kts \) \
-                | sort
-            )
-          fi
-
-          if [ -z "$SRC" ]; then
-            echo "::error::Nie znaleziono projektu z modułem app."
-            find . -maxdepth 6 -type f | head -150
-            exit 1
-          fi
-
-          SRC=$(cd "$SRC" && pwd)
-          echo "src=$SRC" >> "$GITHUB_OUTPUT"
-          echo "Projekt: $SRC"
-          ls -la "$SRC"
-
-      - name: Setup Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: "17"
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Install Android Command-line Tools
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          export ANDROID_SDK_ROOT="$RUNNER_TEMP/android-sdk"
-          export ANDROID_HOME="$ANDROID_SDK_ROOT"
-
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-
-          SDK="$ANDROID_SDK_ROOT"
-          TEMP_TOOLS="$RUNNER_TEMP/android-cli-download"
-
-          mkdir -p "$SDK/cmdline-tools" "$TEMP_TOOLS"
-
-          URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-
-          echo "Pobieram oficjalne Android Command-line Tools..."
-
-          curl -fL --retry 3 "$URL" \
-            -o "$TEMP_TOOLS/commandlinetools.zip"
-
-          unzip -q -o "$TEMP_TOOLS/commandlinetools.zip" \
-            -d "$TEMP_TOOLS"
-
-          if [ ! -f "$TEMP_TOOLS/cmdline-tools/bin/sdkmanager" ]; then
-            echo "::error::Pobrany pakiet nie zawiera sdkmanager."
-            find "$TEMP_TOOLS" -maxdepth 4 -type f | head -80
-            exit 1
-          fi
-
-          rm -rf "$SDK/cmdline-tools/latest"
-          mkdir -p "$SDK/cmdline-tools/latest"
-
-          cp -a "$TEMP_TOOLS/cmdline-tools/." \
-            "$SDK/cmdline-tools/latest/"
-
-          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          chmod +x "$SDKMANAGER"
-
-          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-
-          echo "Android SDK: $SDK"
-          "$SDKMANAGER" --version
-
-      - name: Accept licenses and install SDK packages
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-
-          yes | "$SDKMANAGER" \
-            --sdk_root="$ANDROID_SDK_ROOT" \
-            --licenses || true
-
-          "$SDKMANAGER" \
-            --sdk_root="$ANDROID_SDK_ROOT" \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-
-          echo "=== Installed SDK packages ==="
-
-          "$SDKMANAGER" \
-            --sdk_root="$ANDROID_SDK_ROOT" \
-            --list_installed
-
-      - name: Prepare Gradle
-        id: gradle
-        working-directory: ${{ steps.prepare.outputs.src }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          GRADLE_CMD=""
-
-          if [ -f "./gradlew" ] && \
-             [ -s "./gradle/wrapper/gradle-wrapper.jar" ] && \
-             [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
-
-            chmod +x ./gradlew
-
-            if jar tf gradle/wrapper/gradle-wrapper.jar \
-              >/dev/null 2>&1; then
-              GRADLE_CMD="./gradlew"
-            fi
-          fi
-
-          if [ -z "$GRADLE_CMD" ]; then
-            VERSION="8.9"
-
-            if [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
-              URL=$(grep -E '^distributionUrl=' \
-                gradle/wrapper/gradle-wrapper.properties \
-                | tail -n 1 | cut -d '=' -f 2- \
-                | sed 's/\\:/:/g' || true)
-
-              if [[ "$URL" =~ gradle-([0-9]+\.[0-9]+(\.[0-9]+)?)-(bin|all)\.zip ]]; then
-                VERSION="${BASH_REMATCH[1]}"
-              fi
-            fi
-
-            GRADLE_DIR="$RUNNER_TEMP/gradle"
-            mkdir -p "$GRADLE_DIR"
-
-            echo "Używam Gradle $VERSION"
-
-            if [ ! -x "$GRADLE_DIR/gradle-$VERSION/bin/gradle" ]; then
-              curl -fL --retry 3 \
-                "https://services.gradle.org/distributions/gradle-$VERSION-bin.zip" \
-                -o "$GRADLE_DIR/gradle.zip"
-
-              unzip -q -o "$GRADLE_DIR/gradle.zip" \
-                -d "$GRADLE_DIR"
-
-              rm -f "$GRADLE_DIR/gradle.zip"
-            fi
-
-            GRADLE_CMD="$GRADLE_DIR/gradle-$VERSION/bin/gradle"
-          fi
-
-          echo "gradle_cmd=$GRADLE_CMD" >> "$GITHUB_OUTPUT"
-          "$GRADLE_CMD" --version
-
-      - name: Verify project modules
-        working-directory: ${{ steps.prepare.outputs.src }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -f app/build.gradle ] && \
-             [ ! -f app/build.gradle.kts ]; then
-            echo "::error::Brak konfiguracji modułu app."
-            exit 1
-          fi
-
-          echo "=== Moduły Gradle ==="
-          find . -maxdepth 4 -type f \
-            \( -name build.gradle -o -name build.gradle.kts \) \
-            -print
-
-          if [ ! -f dtcclear/build.gradle ] && \
-             [ ! -f dtcclear/build.gradle.kts ]; then
-            echo "::warning::Nie znaleziono modułu dtcclear."
-          fi
-
-      - name: Run unit tests
-        working-directory: ${{ steps.prepare.outputs.src }}
-        shell: bash
-        continue-on-error: true
-        env:
-          GRADLE_CMD: ${{ steps.gradle.outputs.gradle_cmd }}
-        run: |
-          set -euo pipefail
-          "$GRADLE_CMD" test --stacktrace --no-daemon
-
-      - name: Build APK
-        working-directory: ${{ steps.prepare.outputs.src }}
-        shell: bash
-        env:
-          GRADLE_CMD: ${{ steps.gradle.outputs.gradle_cmd }}
-        run: |
-          set -euo pipefail
-
-          TASKS=(":app:assembleDebug")
-
-          if [ -f dtcclear/build.gradle ] || \
-             [ -f dtcclear/build.gradle.kts ]; then
-            TASKS+=(":dtcclear:assembleDebug")
-          fi
-
-          "$GRADLE_CMD" "${TASKS[@]}" \
-            --stacktrace \
-            --no-daemon
-
-          echo "=== Wygenerowane APK ==="
-          find . -type f -path '*/build/outputs/apk/*/*.apk' -print
-
-          if ! find app/build/outputs/apk \
-            -type f -name '*.apk' -print -quit \
-            2>/dev/null | grep -q .; then
-            echo "::error::Nie wygenerowano APK modułu app."
-            exit 1
-          fi
-
-      - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
         with:
-          name: Honda-OBD-Discovery-APKs
-          path: |
-            ${{ steps.prepare.outputs.src }}/app/build/outputs/apk/**/*.apk
-            ${{ steps.prepare.outputs.src }}/dtcclear/build/outputs/apk/**/*.apk
-          if-no-files-found: error
-          retention-days: 30
+          cmdline-tools-version: '12266719'
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools'
+
+      - name: Install Android SDK Platform & Build-Tools
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Find uploaded ZIP file
+        id: find-zip
+        run: |
+          ZIP_FILE=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '\.zip$' | tail -n 1 || true)
+          if [ -z "$ZIP_FILE" ]; then
+            ZIP_FILE=$(find . -name "*.zip" -not -path "./.git/*" | head -n 1)
+          fi
+          
+          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
+            echo "Error: Nie znaleziono pliku ZIP w repozytorium!"
+            exit 1
+          fi
+          
+          echo "Znaleziono ZIP: $ZIP_FILE"
+          echo "zip_file=$ZIP_FILE" >> $GITHUB_OUTPUT
+          
+          BASENAME=$(basename "$ZIP_FILE" .zip)
+          echo "basename=$BASENAME" >> $GITHUB_OUTPUT
+
+      - name: Extract ZIP contents
+        run: |
+          mkdir -p extracted_source
+          unzip -q "${{ steps.find-zip.outputs.zip_file }}" -d extracted_source
+
+      - name: Locate Gradle project root
+        id: find-gradle
+        run: |
+          GRADLE_FILE=$(find extracted_source -name "settings.gradle" -o -name "build.gradle" | head -n 1)
+          if [ -z "$GRADLE_FILE" ]; then
+            echo "Error: Nie znaleziono pliku build.gradle / settings.gradle wewnątrz ZIP-a!"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$GRADLE_FILE")
+          echo "Katalog projektu: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+
+      - name: Build APK with Gradle
+        run: |
+          cd "${{ steps.find-gradle.outputs.project_dir }}"
+          if [ -f "gradlew" ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug
+          else
+            gradle assembleDebug
+          fi
+
+      - name: Find built APK
+        id: find-apk
+        run: |
+          PROJECT_DIR="${{ steps.find-gradle.outputs.project_dir }}"
+          APK_PATH=$(find "$PROJECT_DIR" -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "Error: Nie znaleziono zbudowanego pliku APK!"
+            exit 1
+          fi
+          echo "Znaleziono APK: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release & Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: release-${{ steps.find-zip.outputs.basename }}-${{ github.run_number }}
+          name: Release ${{ steps.find-zip.outputs.basename }} (Build #${{ github.run_number }})
+          files: |
+            ${{ steps.find-apk.outputs.apk_path }}
+            ${{ steps.find-zip.outputs.zip_file }}
+          body: |
+            Automatyczny release wygenerowany z pliku ZIP: `${{ steps.find-zip.outputs.zip_file }}`
+            Commit: `${{ github.sha }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
