@@ -1,85 +1,97 @@
-name: Build APK from iPhone ZIP
+name: Build Honda OBD Discovery APK
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
+    branches: ["**"]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build APKs
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      # --- Jeśli w repo jest tylko ZIP (bez źródeł), wypakuj ---
+      - name: Wypakuj ZIP gdy brak gradlew w root
+        id: prepare
+        run: |
+          set -euo pipefail
+          if [ -f ./gradlew ]; then
+            echo "src=." >> "$GITHUB_OUTPUT"
+            echo "Źródła już w katalogu głównym"
+            chmod +x ./gradlew
+            exit 0
+          fi
+          ZIP=$(find . -maxdepth 2 -type f \( \
+            -name 'Honda-OBD-Discovery*.zip' \
+            -o -name 'honda-obd*.zip' \
+            -o -name '*OBD*.zip' \
+            -o -name '*.zip' \
+          \) ! -path './.git/*' | head -n 1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "::error::Brak gradlew i brak pliku .zip. Wrzuć źródła albo ZIP do repo."
+            ls -la
+            exit 1
+          fi
+          echo "Wypakowuję: $ZIP"
+          mkdir -p _src
+          unzip -q -o "$ZIP" -d _src
+          if [ -f _src/gradlew ]; then
+            SRC=_src
+          else
+            SRC=$(find _src -maxdepth 3 -type f -name gradlew | head -n 1 | xargs -r dirname)
+          fi
+          if [ -z "${SRC:-}" ] || [ ! -f "$SRC/gradlew" ]; then
+            echo "::error::Po rozpakowaniu nie ma gradlew"
+            find _src -maxdepth 4 | head -50
+            exit 1
+          fi
+          chmod +x "$SRC/gradlew"
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "Źródła: $SRC"
+          ls -la "$SRC"
+
+      - name: Java 21
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: "21"
 
-      - name: Unpack ZIP & prepare workspace
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Licencje SDK
+        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Testy jednostkowe
+        working-directory: ${{ steps.prepare.outputs.src }}
+        run: ./gradlew test --stacktrace --no-daemon
+        continue-on-error: true
+
+      - name: Zbuduj APK (app + Kasuj DTC)
+        working-directory: ${{ steps.prepare.outputs.src }}
         run: |
-          # Znajdź dowolny plik ZIP wrzucony do repozytorium
-          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "::error::Nie znaleziono pliku .zip w repozytorium!"
-            exit 1
-          fi
-
-          echo "Rozpakowywanie: $ZIP_FILE"
-          unzip -o -q "$ZIP_FILE"
-
-          # Usunięcie śmieci dodawanych przez iOS / macOS
-          rm -rf __MACOSX
-          find . -name "._*" -delete || true
-
-          # Znajdź katalog, w którym znajduje się settings.gradle lub settings.gradle.kts
-          SETTINGS_FILE=$(find . -name "settings.gradle*" | head -n 1)
-
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::W pliku ZIP nie znaleziono settings.gradle ani settings.gradle.kts!"
-            exit 1
-          fi
-
-          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
-          echo "Katalog projektu: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-
-          cd "$PROJECT_DIR"
-
-          # Automatyczne dodanie repozytorium JitPack dla biblioteki MPAndroidChart
-          if [ -f "settings.gradle.kts" ] && ! grep -q "jitpack.io" settings.gradle.kts; then
-            echo "Dodawanie JitPack do settings.gradle.kts..."
-            sed -i '/mavenCentral()/a \        maven { url = java.net.URI("https://jitpack.io") }' settings.gradle.kts
-          fi
-
-          # Jeśli w ZIP nie ma pliku gradle-wrapper.jar, wygeneruj go
-          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "Generowanie Gradle Wrapper 8.2..."
-            gradle wrapper --gradle-version 8.2
-          fi
-
-          chmod +x gradlew || true
-
-      - name: Build debug APK
-        run: |
-          cd "$PROJECT_DIR"
-          ./gradlew assembleDebug --stacktrace
+          set -euo pipefail
+          ./gradlew :app:assembleDebug :dtcclear:assembleDebug --stacktrace --no-daemon
+          echo "=== APK ==="
+          find . -path '*/build/outputs/apk/**/*.apk' -type f
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: HondaOBDDiscovery-debug
-          path: "**/build/outputs/apk/debug/*.apk"
+          name: Honda-OBD-Discovery-APKs
+          path: |
+            ${{ steps.prepare.outputs.src }}/app/build/outputs/apk/debug/*.apk
+            ${{ steps.prepare.outputs.src }}/dtcclear/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: HondaOBDDiscovery-debug
-          path: "**/build/outputs/apk/debug/*.apk"
-          if-no-files-found: error
+          retention-days: 30
