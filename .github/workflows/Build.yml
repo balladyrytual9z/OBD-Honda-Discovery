@@ -1,9 +1,11 @@
-name: Build and publish OBD2 Dashboard (ESSGOO)
+name: Build and publish OBD2 Dashboard
 
 on:
   push:
     branches:
       - '**'
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -31,9 +33,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Do NOT use android-actions/setup-android — it requests the obsolete "tools" package.
-      # The GitHub-hosted runner already ships an SDK; we only add the two packages we need.
-      - name: Locate Android SDK and install required packages
+      # GitHub-hosted ubuntu-latest already ships the Android SDK at ANDROID_HOME.
+      # Do not install "tools" here: that package is gone from current SDK repos.
+      # We only verify the pieces the build actually needs are present, and install
+      # platform 35 + build-tools 35 if the runner image is behind.
+      - name: Verify Android SDK
         shell: bash
         run: |
           set -euo pipefail
@@ -48,26 +52,35 @@ jobs:
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print 2>/dev/null | sort -V | tail -n 1 || true)"
-          if [[ -z "$SDKMANAGER" ]]; then
-            echo "ERROR: sdkmanager not found under $SDK_ROOT/cmdline-tools."
-            find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type d -print 2>/dev/null || true
-            exit 1
+          # Only install if the pinned compileSdk (35) is missing. Newer runner
+          # images already have it and skip this step entirely.
+          if [[ ! -d "$SDK_ROOT/platforms/android-35" ]]; then
+            echo "platforms;android-35 not found — installing via sdkmanager"
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print 2>/dev/null | sort -V | tail -n 1 || true)"
+            if [[ -z "$SDKMANAGER" ]]; then
+              echo "ERROR: sdkmanager not found under $SDK_ROOT/cmdline-tools."
+              find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type d -print 2>/dev/null || true
+              exit 1
+            fi
+            set +o pipefail
+            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
+            set -o pipefail
+            "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+              "platform-tools" \
+              "platforms;android-35" \
+              "build-tools;35.0.0"
+          else
+            echo "Android SDK already has platforms;android-35."
           fi
 
-          echo "Using sdkmanager: $SDKMANAGER"
-
-          set +o pipefail
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
-          set -o pipefail
-
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-
-          test -x "$SDK_ROOT/build-tools/35.0.0/apksigner"
-          echo "Android SDK packages installed."
+          # build-tools 35 is what the AGP in this project targets; verify apksigner.
+          BUILD_TOOLS="$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -n 1)"
+          if [[ -z "$BUILD_TOOLS" || ! -x "$BUILD_TOOLS/apksigner" ]]; then
+            echo "ERROR: no usable build-tools with apksigner under $SDK_ROOT/build-tools."
+            exit 1
+          fi
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+          echo "Using build-tools: $BUILD_TOOLS"
 
       - name: Select project folder or uploaded ZIP
         id: source
@@ -79,6 +92,7 @@ jobs:
             PROJECT_DIR="$GITHUB_WORKSPACE"
             echo "Building Gradle project from repository root."
           else
+            # Prefer a ZIP from the pushed commit, else the most recent ZIP in the tree.
             ZIP_PATH="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" -- '*.zip' | head -n 1 || true)"
 
             if [[ -z "$ZIP_PATH" ]]; then
@@ -91,15 +105,12 @@ jobs:
             fi
 
             mkdir -p "$RUNNER_TEMP/obd2-source"
-            # -j unzips multiple concatenated zip archives (common when re-zipping on Windows)
-            unzip -q -j "$ZIP_PATH" -d "$RUNNER_TEMP/obd2-source" 2>/dev/null || \
-              unzip -q "$ZIP_PATH" -d "$RUNNER_TEMP/obd2-source"
+            unzip -q "$ZIP_PATH" -d "$RUNNER_TEMP/obd2-source"
 
+            # The shipped tree is nested (obd2-dashboard-main/...), so search deep enough.
             SETTINGS_FILE="$(find "$RUNNER_TEMP/obd2-source" -maxdepth 6 \( -name settings.gradle -o -name settings.gradle.kts \) -type f | head -n 1)"
             if [[ -z "$SETTINGS_FILE" ]]; then
               echo "ERROR: ZIP $ZIP_PATH does not contain settings.gradle or settings.gradle.kts."
-              echo "ZIP contents (top levels):"
-              find "$RUNNER_TEMP/obd2-source" -maxdepth 3 -type d -print | head -n 30 || true
               exit 1
             fi
 
@@ -112,41 +123,37 @@ jobs:
             exit 1
           fi
 
+          # The project's own wrapper pins Gradle 8.14.3 (see gradle/wrapper/gradle-wrapper.properties).
+          # Use it, so CI and local builds run identical Gradle versions.
+          if [[ -x "$PROJECT_DIR/gradlew" ]]; then
+            echo "Using project Gradle wrapper (gradlew)."
+            echo "use_wrapper=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No gradlew found in $PROJECT_DIR — falling back to setup-gradle's Gradle."
+            echo "use_wrapper=false" >> "$GITHUB_OUTPUT"
+          fi
+
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "Selected project: $PROJECT_DIR"
 
-      # gradlew is a POSIX shell script; after a Windows-created ZIP it may have lost +x.
-      - name: Ensure gradlew is executable
-        shell: bash
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-          if [[ -f gradlew ]]; then
-            chmod +x gradlew
-            head -n 1 gradlew
-          else
-            echo "ERROR: gradlew missing in ${{ steps.source.outputs.project_dir }}"
-            exit 1
-          fi
-
-      # Use the project's own wrapper. libs.versions.toml pins Gradle 8.14.3 + AGP 8.13.2
-      # which require Gradle >= 8.13 — a fixed gradle-version: '8.9' would fail.
-      - name: Set up Gradle (wrapper-aware cache)
+      # Provides `gradle` on PATH when the project ships no wrapper. If it does,
+      # `use_wrapper=true` and this step's Gradle is not used for the build itself.
+      - name: Set up Gradle (fallback when no wrapper)
+        if: steps.source.outputs.use_wrapper == 'false'
         uses: gradle/actions/setup-gradle@v4
         with:
-          cache-read-only: false
-          # Do NOT set gradle-version: the project's wrapper is authoritative.
+          gradle-version: '8.14.3'
 
-      - name: Run unit tests (non-blocking)
-        id: tests
-        continue-on-error: true
+      - name: Run unit tests
         working-directory: ${{ steps.source.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --stacktrace test || {
-            echo "::warning::Unit tests failed — build will continue, APK still published."
-          }
+          if [[ "${{ steps.source.outputs.use_wrapper }}" == "true" ]]; then
+            ./gradlew --no-daemon --stacktrace --no-configuration-cache test
+          else
+            gradle --no-daemon --stacktrace --no-configuration-cache test
+          fi
 
       - name: Build signed release APK
         working-directory: ${{ steps.source.outputs.project_dir }}
@@ -156,29 +163,40 @@ jobs:
         run: |
           set -euo pipefail
 
-          ./gradlew --no-daemon --stacktrace clean assembleRelease
+          # configuration-cache is disabled in CI on purpose:
+          # the play-publisher plugin and the DataStore KSP step both misbehave
+          # under it on this project's AGP/Kotlin combination.
+          if [[ "${{ steps.source.outputs.use_wrapper }}" == "true" ]]; then
+            ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+              clean :app:assembleRelease
+          else
+            gradle --no-daemon --stacktrace --no-configuration-cache \
+              clean :app:assembleRelease
+          fi
 
           APK="app/build/outputs/apk/release/app-release.apk"
           if [[ ! -s "$APK" ]]; then
             echo "ERROR: Release APK was not generated: $APK"
-            echo "APK outputs actually present:"
-            find app/build/outputs -type f -name '*.apk' -print 2>/dev/null || true
             exit 1
           fi
 
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          "$BUILD_TOOLS/apksigner" verify --verbose "$APK"
 
+          # The project signs `release` with the checked-in debug keystore when
+          # keystore.properties is absent (see app/build.gradle.kts). That is fine
+          # for sideloading and for the GitHub Releases this workflow publishes.
+          # It will NOT be accepted by Play — see docs/play/signing.md.
           mkdir -p "$RUNNER_TEMP/release-assets"
-          cp "$APK" "$RUNNER_TEMP/release-assets/OBD2-Dashboard-ESSGOO-${GITHUB_RUN_NUMBER}.apk"
+          cp "$APK" "$RUNNER_TEMP/release-assets/OBD2-Dashboard-${GITHUB_RUN_NUMBER}.apk"
           (
             cd "$RUNNER_TEMP/release-assets"
-            sha256sum "OBD2-Dashboard-ESSGOO-${GITHUB_RUN_NUMBER}.apk" > SHA256SUMS.txt
+            sha256sum "OBD2-Dashboard-${GITHUB_RUN_NUMBER}.apk" > SHA256SUMS.txt
           )
 
       - name: Upload APK as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OBD2-Dashboard-ESSGOO-${{ github.run_number }}
+          name: OBD2-Dashboard-${{ github.run_number }}
           path: ${{ runner.temp }}/release-assets/*
           if-no-files-found: error
           retention-days: 90
@@ -187,24 +205,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}-${{ github.run_attempt }}
-          name: OBD2 Dashboard (ESSGOO) v1.0.${{ github.run_number }}
+          name: OBD2 Dashboard v1.0.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            ${{ runner.temp }}/release-assets/OBD2-Dashboard-ESSGOO-${{ github.run_number }}.apk
+            ${{ runner.temp }}/release-assets/OBD2-Dashboard-${{ github.run_number }}.apk
             ${{ runner.temp }}/release-assets/SHA256SUMS.txt
-          body: |
-            ## OBD2 Dashboard — build ${{ github.run_number }}
-
-            APK podpisany kluczem debug (sideload na ESSGOO 9", Android 9).
-
-            ### Instalacja na tablecie
-            1. Pobierz `OBD2-Dashboard-ESSGOO-${{ github.run_number }}.apk`
-            2. Zezwól na instalację z nieznanych źródeł (Ustawienia → Aplikacje → Specjalny dostęp)
-            3. Zainstaluj. Aktualizacja przez kolejny build z tym samym debug keystore.
-
-            ### Co jest w środku
-            - `versionName` / `versionCode` pochodzą z `app/build.gradle.kts`
-            - Build date: ${{ github.event.head_commit.timestamp || '' }}
-            - Commit: `${{ github.sha }}`
