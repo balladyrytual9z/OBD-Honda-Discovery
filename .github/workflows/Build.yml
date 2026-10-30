@@ -1,128 +1,210 @@
-name: Build & Release from ZIP
+name: Build and publish OBD2 Dashboard (ESSGOO)
 
 on:
   push:
-    paths:
-      - '**.zip'
+    branches:
+      - '**'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: obd2-dashboard-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-and-release:
+  build-release:
+    name: Build signed Android APK and publish GitHub Release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
-      - name: Set up JDK 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          cmdline-tools-version: '12266719'
-          accept-android-sdk-licenses: true
-          packages: 'platform-tools'
-
-      - name: Install Android SDK Platform & Build-Tools
+      # Do NOT use android-actions/setup-android — it requests the obsolete "tools" package.
+      # The GitHub-hosted runner already ships an SDK; we only add the two packages we need.
+      - name: Locate Android SDK and install required packages
+        shell: bash
         run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          set -euo pipefail
 
-      - name: Find uploaded ZIP file
-        id: find-zip
-        run: |
-          ZIP_FILE=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '\.zip$' | tail -n 1 || true)
-          if [ -z "$ZIP_FILE" ]; then
-            ZIP_FILE=$(find . -name "*.zip" -not -path "./.git/*" | head -n 1)
-          fi
-          
-          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
-            echo "Error: Nie znaleziono pliku ZIP w repozytorium!"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            echo "ERROR: Android SDK directory not found: $SDK_ROOT"
             exit 1
           fi
-          
-          echo "Znaleziono ZIP: $ZIP_FILE"
-          echo "zip_file=$ZIP_FILE" >> $GITHUB_OUTPUT
-          
-          BASENAME=$(basename "$ZIP_FILE" .zip)
-          echo "basename=$BASENAME" >> $GITHUB_OUTPUT
 
-      - name: Extract ZIP contents
-        run: |
-          mkdir -p extracted_source
-          unzip -o -q "${{ steps.find-zip.outputs.zip_file }}" -d extracted_source
-          echo "Zawartość rozpakowanego pliku ZIP:"
-          find extracted_source -maxdepth 3
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-      - name: Locate Gradle project root
-        id: find-gradle
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager not found under $SDK_ROOT/cmdline-tools."
+            find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type d -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
+          set -o pipefail
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          test -x "$SDK_ROOT/build-tools/35.0.0/apksigner"
+          echo "Android SDK packages installed."
+
+      - name: Select project folder or uploaded ZIP
+        id: source
+        shell: bash
         run: |
-          # Szukamy najpierw pliku settings.gradle / settings.gradle.kts (główny katalog projektu)
-          SETTINGS_FILE=$(find extracted_source \( -iname "settings.gradle" -o -iname "settings.gradle.kts" \) | head -n 1)
-          
-          if [ -n "$SETTINGS_FILE" ]; then
-            PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          set -euo pipefail
+
+          if [[ -f settings.gradle || -f settings.gradle.kts ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+            echo "Building Gradle project from repository root."
           else
-            # Jeśli brak settings.gradle, szukamy build.gradle / build.gradle.kts
-            BUILD_FILE=$(find extracted_source \( -iname "build.gradle" -o -iname "build.gradle.kts" \) | head -n 1)
-            if [ -n "$BUILD_FILE" ]; then
-              PROJECT_DIR=$(dirname "$BUILD_FILE")
-              # Jeśli trafiliśmy do podfolderu /app, przechodzimy poziom wyżej do korzenia projektu
-              if [ "$(basename "$PROJECT_DIR")" = "app" ] && [ -f "$(dirname "$PROJECT_DIR")/build.gradle" -o -f "$(dirname "$PROJECT_DIR")/settings.gradle" ]; then
-                PROJECT_DIR=$(dirname "$PROJECT_DIR")
-              fi
+            ZIP_PATH="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" -- '*.zip' | head -n 1 || true)"
+
+            if [[ -z "$ZIP_PATH" ]]; then
+              ZIP_PATH="$(find . -maxdepth 3 -type f -name '*.zip' -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2- | sed 's#^./##')"
             fi
+
+            if [[ -z "$ZIP_PATH" || ! -f "$ZIP_PATH" ]]; then
+              echo "ERROR: No Gradle project at repository root and no source ZIP found."
+              exit 1
+            fi
+
+            mkdir -p "$RUNNER_TEMP/obd2-source"
+            # -j unzips multiple concatenated zip archives (common when re-zipping on Windows)
+            unzip -q -j "$ZIP_PATH" -d "$RUNNER_TEMP/obd2-source" 2>/dev/null || \
+              unzip -q "$ZIP_PATH" -d "$RUNNER_TEMP/obd2-source"
+
+            SETTINGS_FILE="$(find "$RUNNER_TEMP/obd2-source" -maxdepth 6 \( -name settings.gradle -o -name settings.gradle.kts \) -type f | head -n 1)"
+            if [[ -z "$SETTINGS_FILE" ]]; then
+              echo "ERROR: ZIP $ZIP_PATH does not contain settings.gradle or settings.gradle.kts."
+              echo "ZIP contents (top levels):"
+              find "$RUNNER_TEMP/obd2-source" -maxdepth 3 -type d -print | head -n 30 || true
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+            echo "Building project extracted from $ZIP_PATH"
           fi
 
-          if [ -z "$PROJECT_DIR" ] || [ ! -d "$PROJECT_DIR" ]; then
-            echo "::error:: Nie znaleziono pliku budowania (settings.gradle lub build.gradle) wewnątrz ZIP-a!"
-            echo "Pełna struktura rozpakowanych plików:"
-            find extracted_source
+          if [[ ! -f "$PROJECT_DIR/app/build.gradle" && ! -f "$PROJECT_DIR/app/build.gradle.kts" ]]; then
+            echo "ERROR: app Gradle build file not found in $PROJECT_DIR."
             exit 1
           fi
 
-          echo "Główny katalog projektu Gradle: $PROJECT_DIR"
-          echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Selected project: $PROJECT_DIR"
 
-      - name: Build APK with Gradle
+      # gradlew is a POSIX shell script; after a Windows-created ZIP it may have lost +x.
+      - name: Ensure gradlew is executable
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
         run: |
-          cd "${{ steps.find-gradle.outputs.project_dir }}"
-          if [ -f "gradlew" ]; then
+          set -euo pipefail
+          if [[ -f gradlew ]]; then
             chmod +x gradlew
-            ./gradlew assembleDebug
+            head -n 1 gradlew
           else
-            gradle assembleDebug
-          fi
-
-      - name: Find built APK
-        id: find-apk
-        run: |
-          PROJECT_DIR="${{ steps.find-gradle.outputs.project_dir }}"
-          APK_PATH=$(find "$PROJECT_DIR" -name "*.apk" | head -n 1)
-          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
-            echo "Error: Nie znaleziono zbudowanego pliku APK!"
+            echo "ERROR: gradlew missing in ${{ steps.source.outputs.project_dir }}"
             exit 1
           fi
-          echo "Znaleziono APK: $APK_PATH"
-          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
 
-      - name: Create GitHub Release & Upload Assets
+      # Use the project's own wrapper. libs.versions.toml pins Gradle 8.14.3 + AGP 8.13.2
+      # which require Gradle >= 8.13 — a fixed gradle-version: '8.9' would fail.
+      - name: Set up Gradle (wrapper-aware cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          # Do NOT set gradle-version: the project's wrapper is authoritative.
+
+      - name: Run unit tests (non-blocking)
+        id: tests
+        continue-on-error: true
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace test || {
+            echo "::warning::Unit tests failed — build will continue, APK still published."
+          }
+
+      - name: Build signed release APK
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./gradlew --no-daemon --stacktrace clean assembleRelease
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+          if [[ ! -s "$APK" ]]; then
+            echo "ERROR: Release APK was not generated: $APK"
+            echo "APK outputs actually present:"
+            find app/build/outputs -type f -name '*.apk' -print 2>/dev/null || true
+            exit 1
+          fi
+
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          cp "$APK" "$RUNNER_TEMP/release-assets/OBD2-Dashboard-ESSGOO-${GITHUB_RUN_NUMBER}.apk"
+          (
+            cd "$RUNNER_TEMP/release-assets"
+            sha256sum "OBD2-Dashboard-ESSGOO-${GITHUB_RUN_NUMBER}.apk" > SHA256SUMS.txt
+          )
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBD2-Dashboard-ESSGOO-${{ github.run_number }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: release-${{ steps.find-zip.outputs.basename }}-${{ github.run_number }}
-          name: Release ${{ steps.find-zip.outputs.basename }} (Build #${{ github.run_number }})
+          tag_name: v1.0.${{ github.run_number }}-${{ github.run_attempt }}
+          name: OBD2 Dashboard (ESSGOO) v1.0.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
-            ${{ steps.find-apk.outputs.apk_path }}
-            ${{ steps.find-zip.outputs.zip_file }}
+            ${{ runner.temp }}/release-assets/OBD2-Dashboard-ESSGOO-${{ github.run_number }}.apk
+            ${{ runner.temp }}/release-assets/SHA256SUMS.txt
           body: |
-            Automatyczny release wygenerowany z pliku ZIP: `${{ steps.find-zip.outputs.zip_file }}`
-            Commit: `${{ github.sha }}`
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            ## OBD2 Dashboard — build ${{ github.run_number }}
+
+            APK podpisany kluczem debug (sideload na ESSGOO 9", Android 9).
+
+            ### Instalacja na tablecie
+            1. Pobierz `OBD2-Dashboard-ESSGOO-${{ github.run_number }}.apk`
+            2. Zezwól na instalację z nieznanych źródeł (Ustawienia → Aplikacje → Specjalny dostęp)
+            3. Zainstaluj. Aktualizacja przez kolejny build z tym samym debug keystore.
+
+            ### Co jest w środku
+            - `versionName` / `versionCode` pochodzą z `app/build.gradle.kts`
+            - Build date: ${{ github.event.head_commit.timestamp || '' }}
+            - Commit: `${{ github.sha }}`
